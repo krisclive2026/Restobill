@@ -158,15 +158,47 @@ def _cg_write_ts(ts: float):
  
 def _cg_check_rollback() -> bool:
     max_ts = _cg_read_max_ts()
+    # Also read the max timestamp embedded in the license file itself
+    # so deleting clock_guard.dat alone doesn't bypass protection.
+    try:
+        from cryptography.fernet import Fernet as _F
+        if os.path.exists(LICENSE_FILE):
+            with open(LICENSE_FILE, "rb") as f:
+                enc = f.read()
+            key = _derive_fernet_key()
+            dec = _F(key).decrypt(enc)
+            lic_data = json.loads(dec.decode("utf-8"))
+            lic_ts = float(lic_data.get("max_ts", 0))
+            max_ts = max(max_ts, lic_ts)
+    except Exception:
+        pass
     if max_ts == 0.0:
         return False
     now = time.time()
     TOLERANCE = 300
     return now < (max_ts - TOLERANCE)
- 
- 
+
+
 def _cg_update():
     _cg_write_ts(time.time())
+    # Also embed the timestamp into the license record so clock_guard.dat
+    # deletion alone cannot reset the rollback protection.
+    try:
+        from cryptography.fernet import Fernet as _F
+        if os.path.exists(LICENSE_FILE):
+            key = _derive_fernet_key()
+            with open(LICENSE_FILE, "rb") as f:
+                enc = f.read()
+            lic_data = json.loads(_F(key).decrypt(enc).decode("utf-8"))
+            ts = time.time()
+            if ts > float(lic_data.get("max_ts", 0)):
+                lic_data["max_ts"] = ts
+                lic_data.pop("id", None)
+                encrypted = _F(key).encrypt(json.dumps(lic_data).encode("utf-8"))
+                with open(LICENSE_FILE, "wb") as f:
+                    f.write(encrypted)
+    except Exception:
+        pass
  
  
 # ═══════════════════════════════════════════════════════════════
@@ -710,9 +742,33 @@ class AuthDB:
 #  LICENSE SYSTEM
 # ═══════════════════════════════════════════════════════════════
  
-def _get_machine_id() -> str:
+def _get_legacy_machine_id() -> str:
+    """Legacy machine ID used by older builds."""
     raw = str(uuid.getnode())
     return hashlib.sha256(raw.encode()).hexdigest()[:24].upper()
+
+
+@functools.lru_cache(maxsize=1)
+def _get_machine_id() -> str:
+    """
+    Prefer a stable Windows MachineGuid so the license does not
+    change across boots. Fall back to the legacy MAC-derived ID.
+    """
+    if sys.platform == "win32":
+        try:
+            import winreg
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SOFTWARE\Microsoft\Cryptography",
+            ) as key:
+                machine_guid, _ = winreg.QueryValueEx(key, "MachineGuid")
+            machine_guid = str(machine_guid).strip()
+            if machine_guid:
+                raw = machine_guid
+                return hashlib.sha256(raw.encode()).hexdigest()[:24].upper()
+        except Exception:
+            pass
+    return _get_legacy_machine_id()
  
  
 _KF1 = "Zn9kfm4dA3YWfBBiYx0UBhFrGQwKbnJrHHI4fXt/HRElEwUQLjgyNy1YGAtHAnQeCQoUChMGEAIOfnASe3lwdTgTDBMaFwgnexd/d2dxQEo="
@@ -754,11 +810,14 @@ def _load_public_key():
     return load_pem_public_key(_bill_pub_pem())
  
  
-def _derive_fernet_key() -> bytes:
+def _derive_fernet_key_for(machine_id: str) -> bytes:
     from cryptography.fernet import Fernet
-    machine_id = _get_machine_id()
     raw = hashlib.sha256(f"KRISC_BILL_FERNET::{machine_id}".encode()).digest()
     return base64.urlsafe_b64encode(raw)
+
+
+def _derive_fernet_key() -> bytes:
+    return _derive_fernet_key_for(_get_machine_id())
  
  
 def _parse_activation_key(activation_key: str):
@@ -781,7 +840,7 @@ def _verify_activation_key(machine_id: str, activation_key: str):
         from cryptography.hazmat.primitives import hashes as _h
         expiry_date, sig_b64 = _parse_activation_key(activation_key)
         payload   = f"{machine_id.upper()}|{expiry_date}".encode("utf-8")
-        signature = base64.b64decode(sig_b64)
+        signature = base64.b64decode("".join(sig_b64.split()))
         pub_key   = _load_public_key()
         pub_key.verify(
             signature, payload,
@@ -798,7 +857,7 @@ def _verify_renewal_key(serial: str, machine_id: str, expiry_date: str, renewal_
         from cryptography.hazmat.primitives.asymmetric import padding as _p
         from cryptography.hazmat.primitives import hashes as _h
         payload   = f"{serial.upper()}|{machine_id.upper()}|{expiry_date}".encode("utf-8")
-        signature = base64.b64decode(renewal_key.strip())
+        signature = base64.b64decode("".join(renewal_key.split()))
         pub_key   = _load_public_key()
         pub_key.verify(
             signature, payload,
@@ -844,8 +903,29 @@ class LicenseDB:
         try:
             with open(self._path, "rb") as f:
                 encrypted = f.read()
-            decrypted = self._get_fernet().decrypt(encrypted)
-            return json.loads(decrypted.decode("utf-8"))
+            current_mid = _get_machine_id()
+            attempts = (
+                (current_mid, self._get_fernet()),
+                (_get_legacy_machine_id(), None),
+            )
+            last_error = None
+            for machine_id, fernet in attempts:
+                try:
+                    if fernet is None:
+                        from cryptography.fernet import Fernet
+                        fernet = Fernet(_derive_fernet_key_for(machine_id))
+                    decrypted = fernet.decrypt(encrypted)
+                    data = json.loads(decrypted.decode("utf-8"))
+                    # Migrate older records that were encrypted with the
+                    # legacy machine id so the license keeps working after
+                    # the app switches to a stable Windows MachineGuid.
+                    if data.get("machine_id") != current_mid:
+                        data["machine_id"] = current_mid
+                        self.save(data)
+                    return data
+                except Exception as e:
+                    last_error = e
+            raise last_error or ValueError("Unable to decrypt license")
         except Exception as e:
             print(f"[LicenseDB] load error (tampered?): {e}")
             return None
@@ -887,7 +967,12 @@ class LicenseManager:
             raise ValueError("Invalid Secret Key.")
  
     def is_activated(self) -> bool:
-        return os.path.exists(self._db._path) and self._db.load() is not None
+        if not os.path.exists(self._db._path):
+            return False
+        data = self._db.load()
+        if data is None:
+            return False
+        return data.get("machine_id", "") == _get_machine_id()
     
     def check_license(self):
         if not os.path.exists(self._db._path):
@@ -900,7 +985,13 @@ class LicenseManager:
         if data.get("machine_id", "") != _get_machine_id():
             return "blocked", 0
 
-        # Only check clock guard (rollback detection), remove the last_seen check
+        # Always stamp the current time so clock_guard.dat is updated
+        # on every launch — including post-expiry runs — so rolling back
+        # past the expiry date is caught even after the license expires.
+        _cg_write_ts(time.time())
+
+        # Rollback check must happen AFTER stamping so the stored max
+        # is always the real latest timestamp seen.
         if _cg_check_rollback():
             return "blocked", 0
 
@@ -948,9 +1039,33 @@ class LicenseManager:
  
         serial     = data["serial"]
         machine_id = data["machine_id"]
-        new_expiry = (datetime.now() + timedelta(days=365)).strftime("%Y-%m-%d")
+
+        # Renewal key format: YYYY-MM-DD:<RSA-PSS-BASE64-SIGNATURE>
+        # Parse without reusing _parse_activation_key so error messages
+        # are specific to renewal and not confusingly labelled "activation".
+        rk = renewal_key.strip()
+        if ":" not in rk:
+            return False, (
+                "Invalid renewal key.\n"
+                "Expected format: YYYY-MM-DD:<signature>\n"
+                "Make sure you copied the full key from the key generator."
+            )
+        new_expiry, _, sig_b64 = rk.partition(":")
+        new_expiry = new_expiry.strip()
+        # Remove ALL whitespace including embedded newlines from sig.
+        # The Text widget wraps long base64 across lines.
+        sig_b64    = "".join(sig_b64.split())
+        try:
+            datetime.strptime(new_expiry, "%Y-%m-%d")
+        except ValueError:
+            return False, (
+                "Invalid renewal key: date portion is not valid.\n"
+                "Expected format: YYYY-MM-DD:<signature>"
+            )
+        if not sig_b64:
+            return False, "Invalid renewal key: signature portion is missing."
  
-        if not _verify_renewal_key(serial, machine_id, new_expiry, renewal_key):
+        if not _verify_renewal_key(serial, machine_id, new_expiry, sig_b64):
             return False, (
                 "Invalid renewal key.\n"
                 "Please ensure you entered the correct key provided by KRISC support."
@@ -1266,6 +1381,9 @@ def _check_license_gate() -> bool:
             except Exception:
                 lm._db.save(data)
         return True
+
+    _show_blocked_window(reason=status)
+    return False
  
  
 # ═══════════════════════════════════════════════════════════════
